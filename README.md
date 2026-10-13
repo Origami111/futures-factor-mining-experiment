@@ -24,7 +24,8 @@
 - **行情**：新浪免费实时报价 + K 线历史（自选列表 / 品种树 / 五档盘口
   依赖所接行情源能力）
 - **因子实验室**：内置 60+ 特征的表达式因子挖掘，token 编码可复现
-- **回测**：多周期 K 线回测、AI 生成 K 线回测、决策模型回测
+- **回测**：多周期 K 线回测、AI 生成 K 线回测（可选接入自有历史数据做
+  真实微观结构种子）、决策模型回测
 - **模拟交易**：纸面账户、挂单撮合、持仓 / 权益曲线、平仓标准
   （指标死叉 / 因子阈值 / 波段参考等）
 - **量化任务**：策略信号实时计算、多周期共振、信号 K 线止损
@@ -56,6 +57,45 @@ docker compose up -d
 | `openctp_724` | [openctp](https://github.com/openctp/openctp) 7×24 模拟环境（虚拟盘用） |
 
 付费 / 私有行情源不在本仓库内置，接口地址一律由部署者自行配置。
+
+## AI 生成 K 线：接入真实历史数据（可选）
+
+「AI 生成 K 线」默认用 LLM 剧本 + 程序化随机过程合成行情，不依赖任何
+外部数据。可选接入你自己的历史 K 线作为**真实种子**：生成前随机抽取
+该品种一段真实历史，标定微观结构——波动率聚集、时段边界跳空（隔夜/
+午休）、量能分布、引线比例、tick 精度——合成行情会更贴近该品种的
+真实形态。两种接入方式：
+
+**方式一：CSV 目录（零代码）**
+
+把历史 K 线放到 `backend/data/kline/`（或环境变量
+`QIHUO_SYNTHETIC_SEED_CSV_DIR` 指定的目录），文件命名
+`{品种}_{周期}.csv`（如 `rb_1d.csv`、`pp_5m.csv`），UTF-8 表头：
+
+```csv
+time,open,high,low,close,volume
+2018-01-02,3850.0,3892.0,3811.0,3855.0,2758346
+2018-01-03,3856.0,3860.0,3771.0,3788.0,2738030
+```
+
+- `time`：日线 `YYYY-MM-DD`，分钟线 `YYYY-MM-DD HH:MM:SS`（乱序会自动排序）
+- 根数越多可抽取的随机时段越丰富（单文件至少 80 根生效）
+
+**方式二：Provider 钩子（代码接入）**
+
+```python
+from app.services.backtest.synthetic_seed import register_history_provider
+
+async def my_history(symbol: str, timeframe: str) -> list[dict] | None:
+    # 对接自己的数据库/行情 API：返回该品种完整历史（升序，
+    # 键 time/open/high/low/close/volume），不可用时返回 None
+    ...
+
+register_history_provider(my_history)
+```
+
+未接入或数据不足时自动回退纯合成，生成流程不受影响；接入后回放页顶部
+会显示「真实种子 日期区间 · 根数」标明本次使用的种子段。
 
 ## 免责声明
 
