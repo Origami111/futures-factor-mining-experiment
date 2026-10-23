@@ -9,6 +9,7 @@
  */
 
 import { useState } from "react"
+import Link from "next/link"
 import { FlaskConical, Database, Sparkles } from "lucide-react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { BacktestForm } from "@/components/backtest/backtest-form"
@@ -65,6 +66,11 @@ export default function BacktestPage(): React.JSX.Element {
           不占用真实模拟账户
         </p>
       </div>
+
+      <Link href="/practice" className="mb-4 flex items-center justify-between gap-3 rounded-xl border border-sky-500/30 bg-sky-500/5 p-4 text-sm text-sky-300 hover:bg-sky-500/10">
+        <span><span className="font-semibold">自己看盘、自己买卖？试试手动交易练习</span><span className="mt-1 block text-xs text-[var(--text-secondary)]">逐根揭晓模拟 K 线，手动做多、做空和平仓，结束后复盘。免登录，无需配置 AI。</span></span>
+        <span className="shrink-0">进入练习 →</span>
+      </Link>
 
       {/* 数据来源开关 */}
       <div className="mb-4 flex gap-2">

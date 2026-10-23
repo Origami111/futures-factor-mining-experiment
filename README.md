@@ -27,6 +27,7 @@
 - **回测**：多周期 K 线回测、AI 生成 K 线回测、决策模型回测
 - **模拟交易**：纸面账户、挂单撮合、持仓 / 权益曲线、平仓标准
   （指标死叉 / 因子阈值 / 波段参考等）
+- **手动 K 线练习**：随机模拟行情逐根回放，手动做多 / 做空 / 平仓，查看盈亏并复盘；无需登录
 - **量化任务**：策略信号实时计算、多周期共振、信号 K 线止损
 - **AI 看盘**：LLM 驱动的主播式盘面播报与交易辅助（自配模型渠道）
 - **管理后台**：行情渠道监控 / 主备切换、K 线源配置、用户与配额管理
@@ -46,6 +47,24 @@ docker compose up -d
 
 详细自部署步骤（数据库建表、数据配置、环境变量）见
 [docs/SELF-HOSTING.md](docs/SELF-HOSTING.md)。
+
+### Docker 中启用手动交易练习
+
+已有 Docker 部署在项目根目录执行（沿用原 `.env` / `--env-file`、项目名和其他部署参数）：
+
+```bash
+docker compose -f docker-compose.yml -f compose.practice.yml up -d --build --no-deps frontend
+```
+
+首次完整部署请先准备原项目的数据库、环境文件和必填镜像变量，再执行：
+
+```bash
+docker compose -f docker-compose.yml -f compose.practice.yml up -d --build
+```
+
+打开原网站地址后的 **`/practice`**，默认是 `http://localhost:3000/practice`。练习复用前端容器，旧发布镜像需要重建；以后更新或重新创建容器时也要保留 `-f compose.practice.yml`。前端使用 `restart: unless-stopped`，首次启动成功后可随 Docker 引擎恢复运行。
+
+环境文件要求、不同部署参数的保留方式，以及 Windows 本机启动入口见[手动练习使用说明](docs/MANUAL-PRACTICE.md)。
 
 ## 行情源
 

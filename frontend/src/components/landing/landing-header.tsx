@@ -50,6 +50,12 @@ export function LandingHeader({
         </nav>
 
         <div className="flex items-center gap-2">
+          <Link
+            href="/practice"
+            className="inline-flex items-center rounded-full border border-sky-500/40 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-200 hover:bg-sky-500/20"
+          >
+            交易练习
+          </Link>
           {loggedIn ? (
             <>
               <span className="hidden sm:inline text-[11px] text-[var(--text-muted)] max-w-[120px] truncate">

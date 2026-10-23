@@ -8,6 +8,8 @@ __pycache__/
 
 # Node.js
 node_modules/
+.pnpm-store/
+.local-validation/
 .next/
 
 # 日志（只排除日志文件，不影响前端 admin/logs 页面）
