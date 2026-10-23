@@ -226,6 +226,15 @@ export interface SyntheticGenerateResponse {
     amplitude: number
     symbol: string
     timeframe: string
+    /** 真实历史种子（生成前随机抽取的同品种历史段校准微观结构） */
+    history_seed?: {
+      used: boolean
+      symbol?: string
+      start?: string
+      end?: string
+      bars?: number
+      [k: string]: unknown
+    }
   }
 }
 

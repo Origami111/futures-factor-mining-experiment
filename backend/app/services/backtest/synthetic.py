@@ -5,10 +5,12 @@
    这样单次 LLM 调用即可，质量稳定、可生成任意根数。
 2. 后端用 **几何布朗运动 (GBM) + 跳跃扩散** 把剧本程序化渲染成具体 OHLCV，
    贴合所选品种的真实价格量级、日内振幅、合约乘数。
-3. step 推进器无状态：每根 K 线收盘时由前端回传"已可见前缀 + 账户快照"，
+3. 接入了历史数据（CSV 目录或 register_history_provider，见 synthetic_seed）
+   时先随机抽取该品种一段真实历史 K 线作**种子**，剧本提示词与渲染器都按
+   种子校准——波动率聚集、时段跳空、量能分布等微观结构来自真实行情而非
+   理想化假设；未接入/失败回退纯合成。
+4. step 推进器无状态：每根 K 线收盘时由前端回传"已可见前缀 + 账户快照"，
    后端重建窗口与 VirtualAccount 后调用既有策略引擎，回传决策与最新账户快照。
-
-不依赖任何行情/历史数据源；剧本生成失败时回退到默认随机剧本。
 """
 
 from __future__ import annotations
@@ -27,6 +29,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.services.backtest.account import VirtualAccount
 from app.services.backtest.data import TIMEFRAME_MAX_DAYS
 from app.services.backtest.signals import apply_hard_rules, normalize_action, quant_signal
+from app.services.backtest.synthetic_seed import (
+    HistorySeedProfile,
+    build_seed_profile,
+    is_session_boundary,
+    resolve_seed_segment,
+    summarize_seed_for_prompt,
+)
 from app.services.paper.specs import resolve_trade_params
 
 logger = logging.getLogger("qihuo.synthetic")
@@ -127,15 +136,20 @@ _PROMPT_SYSTEM = """你是期货市场剧本设计师。请输出一个 JSON 对
 def _build_user_prompt(
     *, symbol: str, symbol_name: str, timeframe: str, num_bars: int,
     ref_price: float, amplitude: float,
+    seed_summary: str | None = None,
 ) -> str:
     tf_label = {"1d": "日线", "60m": "60分钟", "30m": "30分钟",
                 "15m": "15分钟", "5m": "5分钟", "1m": "1分钟"}.get(timeframe, timeframe)
     sym_label = f"{symbol_name}({symbol})" if symbol_name else (symbol or "通用品种")
-    return (
+    prompt = (
         f"品种：{sym_label}，参考价约 {ref_price:.0f}，周期：{tf_label}，"
         f"日内振幅约 {amplitude*100:.1f}%，需生成约 {num_bars} 根 K 线。"
         f"请在该品种的价格量级和振幅范围内设计剧本。"
     )
+    if seed_summary:
+        # 有真实历史种子时，统计约束以种子为准（上文 amplitude 即种子标定值）
+        prompt = prompt + "\n\n" + seed_summary
+    return prompt
 
 
 async def generate_market_script(
@@ -149,8 +163,13 @@ async def generate_market_script(
     num_bars: int,
     ref_price: float,
     amplitude: float,
+    seed_profile: HistorySeedProfile | None = None,
 ) -> MarketScript:
-    """调 LLM 产出市场剧本；失败回退到默认随机剧本。"""
+    """调 LLM 产出市场剧本；失败回退到默认随机剧本。
+
+    seed_profile 非空时：提示词附带真实历史种子摘要，剧本量级被
+    种子统计约束（volatility 收敛区间的 amp 即种子振幅中位）。
+    """
     from app.services.factor_lab.llm.llm_http import chat_once, extract_json_object
 
     messages = [
@@ -158,6 +177,7 @@ async def generate_market_script(
         {"role": "user", "content": _build_user_prompt(
             symbol=symbol, symbol_name=symbol_name, timeframe=timeframe,
             num_bars=num_bars, ref_price=ref_price, amplitude=amplitude,
+            seed_summary=summarize_seed_for_prompt(seed_profile) if seed_profile else None,
         )},
     ]
     try:
@@ -165,40 +185,59 @@ async def generate_market_script(
         raw = await chat_once(session, user_id, mid, messages, temperature=0.9, max_tokens=600)
     except Exception as exc:
         logger.warning("合成剧本 LLM 调用失败，回退默认剧本: %s", exc)
-        return _default_script(timeframe)
+        return _default_script(timeframe, seed_profile=seed_profile)
 
     data = extract_json_object(raw)
     if data is None:
         logger.warning("合成剧本 LLM 输出非 JSON，回退默认剧本")
-        return _default_script(timeframe)
-    return _coerce_script(data, timeframe)
+        return _default_script(timeframe, seed_profile=seed_profile)
+    return _coerce_script(data, timeframe, amp=amplitude)
 
 
-def _default_script(timeframe: str) -> MarketScript:
-    """LLM 不可用时的默认剧本（带随机 regime）"""
+def _default_script(
+    timeframe: str,
+    *,
+    seed_profile: HistorySeedProfile | None = None,
+) -> MarketScript:
+    """LLM 不可用时的默认剧本（带随机 regime）。
+
+    有种子时波动率/跳跃直接取种子统计，保证回退路径也具备真实量级。
+    """
     rng = random.Random()
     regime = rng.choice(list(_REGIME_DESC.keys()))
-    amp = DEFAULT_AMPLITUDE.get(timeframe, 0.015)
+    if seed_profile is not None:
+        amp = seed_profile.amplitude
+        vol = round(min(amp * 2.0, max(amp * 0.3, seed_profile.bar_sigma)), 4)
+        jump_size = round(
+            min(0.08, max(0.01, abs(seed_profile.gap_mean) + 2 * seed_profile.gap_std)), 3
+        )
+    else:
+        amp = DEFAULT_AMPLITUDE.get(timeframe, 0.015)
+        vol = round(amp * 0.8, 4)
+        jump_size = round(rng.uniform(0.015, 0.04), 3)
     return MarketScript(
         regime=regime,
         trend_strength=round(rng.uniform(0.3, 0.7), 3),
-        volatility=round(amp * 0.8, 4),
+        volatility=vol,
         drift_bps=round(rng.uniform(-20, 20), 2),
         jumps=[
             {"at": round(rng.random(), 2),
              "direction": rng.choice(["up", "down"]),
-             "size": round(rng.uniform(0.015, 0.04), 3)}
+             "size": jump_size}
             for _ in range(rng.randint(1, 2))
         ],
         volume_pattern=rng.choice(["trending", "high_open_low_mid", "spiky", "fading"]),
     )
 
 
-def _coerce_script(data: dict[str, Any], timeframe: str) -> MarketScript:
-    """把 LLM 输出强制收敛到合法范围"""
+def _coerce_script(
+    data: dict[str, Any], timeframe: str, *, amp: float | None = None
+) -> MarketScript:
+    """把 LLM 输出强制收敛到合法范围（amp 为振幅基准，种子时=种子振幅中位）"""
     valid_regimes = set(_REGIME_DESC.keys())
     valid_vol = {"trending", "high_open_low_mid", "spiky", "fading"}
-    amp = DEFAULT_AMPLITUDE.get(timeframe, 0.015)
+    if amp is None:
+        amp = DEFAULT_AMPLITUDE.get(timeframe, 0.015)
 
     regime = str(data.get("regime") or "").strip().lower()
     if regime not in valid_regimes:
@@ -284,9 +323,17 @@ def _jump_impact(script: MarketScript, progress: float, rng: random.Random) -> f
     return total
 
 
-def _gen_volume(script: MarketScript, progress: float, rng: random.Random,
-                bar_ret: float, base_vol: int) -> int:
-    """按 volume_pattern 生成成交量"""
+def _gen_volume(
+    script: MarketScript, progress: float, rng: random.Random,
+    bar_ret: float, base_vol: int,
+    *,
+    log_sigma: float = 0.0, edge_factor: float = 1.0, is_edge: bool = False,
+) -> int:
+    """按 volume_pattern 生成成交量。
+
+    种子校准时：base_vol=种子量中位，噪声从均匀扰动换对数正态
+    （宽度=种子 P20/P80 离散度），首末时段按种子标定的 edge_factor 放大。
+    """
     pat = script.volume_pattern
     if pat == "trending":
         # 趋势中放大 abs(收益) 对应的量
@@ -299,7 +346,13 @@ def _gen_volume(script: MarketScript, progress: float, rng: random.Random,
         scale = max(0.3, 2.0 - progress * 1.7)
     else:
         scale = 1.0
-    vol = int(base_vol * scale * rng.uniform(0.7, 1.3))
+    if log_sigma > 0:
+        noise = rng.lognormvariate(0.0, log_sigma)
+    else:
+        noise = rng.uniform(0.7, 1.3)
+    if is_edge and edge_factor > 1.0:
+        noise *= edge_factor
+    vol = int(base_vol * scale * noise)
     return max(1, vol)
 
 
@@ -374,8 +427,17 @@ def render_bars_from_script(
     ref_price: float,
     amplitude: float,
     seed: int | None = None,
+    seed_profile: HistorySeedProfile | None = None,
 ) -> list[dict[str, Any]]:
-    """用 GBM + 跳跃扩散把剧本渲染成 OHLCV K 线序列"""
+    """用 GBM + 跳跃扩散把剧本渲染成 OHLCV K 线序列。
+
+    seed_profile 非空时按真实历史种子校准微观结构：
+    - 波动率聚集：对数波动率 AR(1)，持续性=种子 |收益| 自相关；
+    - 跳空：时段边界（隔夜/午休）开盘价按种子 gap 分布跳开；
+    - 流动性约束：量能中位/离散度/首末时段放大、引线比例、
+      单根振幅 P99 上限、价格小数位全部取种子标定值。
+    无种子时保持既有默认行为（兼容旧调用与测试）。
+    """
     n = max(1, min(MAX_BARS, int(num_bars)))
     rng = random.Random(seed) if seed is not None else random.Random()
 
@@ -385,41 +447,94 @@ def render_bars_from_script(
     prev_close = ref_price
     bars: list[dict[str, Any]] = []
 
+    # —— 种子校准参数（无种子时全部退化为既有默认）——
+    use_seed = seed_profile is not None
+    if use_seed:
+        assert seed_profile is not None
+        # LLM 剧本的 volatility 表达相对种子振幅的倍率（防量级漂移）
+        vol_mult = min(2.5, max(0.4, script.volatility / max(seed_profile.amplitude, 1e-9)))
+        sigma_base = max(1e-5, seed_profile.bar_sigma * vol_mult)
+        phi = min(0.97, max(0.5, seed_profile.vol_persistence))
+        sigma_lv = min(0.9, max(0.05, seed_profile.vol_of_vol)) * 0.6
+        sigma_lv_sqrt = math.sqrt(max(0.0, 1.0 - phi * phi))
+        base_vol = max(1.0, seed_profile.vol_median)
+        decimals = seed_profile.decimals
+        tick = 10 ** (-decimals) if decimals > 0 else 1.0
+        wick_med = seed_profile.wick_per_body_med
+        wick_spread = max(0.05, (seed_profile.wick_per_body_hi - wick_med) / 1.5)
+        wick_cap = max(0.1, seed_profile.wick_per_body_hi * 1.5)
+        ln_v = math.log(sigma_base)
+        # 时段边界标记（首根不算）：隔夜/午休开盘会跳空、量能放大
+        boundary = [False] * n
+        for i in range(1, n):
+            boundary[i] = is_session_boundary(times[i - 1], times[i], timeframe)
+        gap_cap = max(3 * seed_profile.gap_std, 0.02)
+
     for i in range(n):
         progress = i / max(1, n - 1)
         # 每根 bar 的对数收益 = 漂移 + 高斯扰动 + 跳跃
         mu = _regime_drift(script, progress)
+        if use_seed:
+            # 波动率聚集：对数波动率围绕 ln(sigma_base) 做 AR(1)，
+            # 持续性 phi 高 → 高波动/低波动成簇出现（真实市场特征）
+            ln_v = (
+                phi * ln_v + (1 - phi) * math.log(sigma_base)
+                + sigma_lv_sqrt * sigma_lv * rng.gauss(0, 1)
+            )
+            bar_sigma = math.exp(ln_v)
+        else:
+            bar_sigma = sigma * 0.6  # 单根波动小于日内总波动
         z = rng.gauss(0, 1)
-        bar_sigma = sigma * 0.6  # 单根波动小于日内总波动
         jump = _jump_impact(script, progress, rng)
+        # 时段边界跳空：开盘价相对昨收按种子 gap 分布跳开（概率=gap_rate）
+        gap = 0.0
+        if use_seed and i > 0 and boundary[i] and rng.random() < seed_profile.gap_rate:
+            g = rng.gauss(seed_profile.gap_mean, seed_profile.gap_std)
+            gap = min(gap_cap, max(-gap_cap, g))
+        open_px = prev_close * math.exp(gap)
         log_ret = mu + bar_sigma * z + jump
-        new_close = prev_close * math.exp(log_ret)
-        # 防止极端值
+        new_close = open_px * math.exp(log_ret)
+        # 防止极端值（含跳空后仍以昨收 ±15% 兜底）
         new_close = max(prev_close * 0.85, min(prev_close * 1.15, new_close))
 
-        o = prev_close
+        o = open_px
         c = new_close
-        # 真实 K 线引线：约为实体的一部分 + 少量随机噪声，明显短于实体
-        # 真实期货日线：上下引线合计约占振幅 30-50%，单边引线通常 < 实体一半
-        body = abs(c - o)
-        body_min = ref_price * 0.0008  # 极小实体的下限，避免除零和退化
-        eff_body = max(body, body_min)
-        # 上引线：实体 10%-50% + 小幅噪声
-        upper_wick = eff_body * rng.uniform(0.10, 0.50) + ref_price * 0.0003 * abs(rng.gauss(0, 1))
-        # 下引线：实体 10%-50% + 小幅噪声
-        lower_wick = eff_body * rng.uniform(0.10, 0.50) + ref_price * 0.0003 * abs(rng.gauss(0, 1))
-        # 跳跃事件可以适度放大引线（但仍是实体量级）
-        if abs(jump) > 0:
-            upper_wick += eff_body * abs(jump) * 5
-            lower_wick += eff_body * abs(jump) * 5
-        hi = max(o, c) + upper_wick
-        lo = min(o, c) - lower_wick
-        # 防御：保证 high >= max(o,c) + 最小tick，low <= min(o,c) - 最小tick
-        tick = ref_price * 0.0005
-        hi = max(hi, max(o, c) + tick)
-        lo = min(lo, min(o, c) - tick)
-        # 极端防御：单根总振幅不超过 10%（真实期货日内极少超过）
-        max_swing = ref_price * 0.05
+        if use_seed:
+            # 引线比例取种子标定（相对实体），tick 精度兜底
+            body_min = tick * 2
+            eff_body = max(abs(c - o), body_min)
+            uw = min(wick_cap, max(0.02, rng.gauss(wick_med, wick_spread)))
+            lw = min(wick_cap, max(0.02, rng.gauss(wick_med, wick_spread)))
+            upper_wick = eff_body * uw + tick * 0.5
+            lower_wick = eff_body * lw + tick * 0.5
+            hi = max(o, c) + upper_wick
+            lo = min(o, c) - lower_wick
+            hi = max(hi, max(o, c) + tick)
+            lo = min(lo, min(o, c) - tick)
+            # 流动性约束：单根总振幅不超过种子 P99（真实市场极少越界）
+            max_swing = max(o * seed_profile.range_frac_p99, 4 * bar_sigma * o)
+        else:
+            # 真实 K 线引线：约为实体的一部分 + 少量随机噪声，明显短于实体
+            # 真实期货日线：上下引线合计约占振幅 30-50%，单边引线通常 < 实体一半
+            body = abs(c - o)
+            body_min = ref_price * 0.0008  # 极小实体的下限，避免除零和退化
+            eff_body = max(body, body_min)
+            # 上引线：实体 10%-50% + 小幅噪声
+            upper_wick = eff_body * rng.uniform(0.10, 0.50) + ref_price * 0.0003 * abs(rng.gauss(0, 1))
+            # 下引线：实体 10%-50% + 小幅噪声
+            lower_wick = eff_body * rng.uniform(0.10, 0.50) + ref_price * 0.0003 * abs(rng.gauss(0, 1))
+            # 跳跃事件可以适度放大引线（但仍是实体量级）
+            if abs(jump) > 0:
+                upper_wick += eff_body * abs(jump) * 5
+                lower_wick += eff_body * abs(jump) * 5
+            hi = max(o, c) + upper_wick
+            lo = min(o, c) - lower_wick
+            # 防御：保证 high >= max(o,c) + 最小tick，low <= min(o,c) - 最小tick
+            tick = ref_price * 0.0005
+            hi = max(hi, max(o, c) + tick)
+            lo = min(lo, min(o, c) - tick)
+            # 极端防御：单根总振幅不超过 10%（真实期货日内极少超过）
+            max_swing = ref_price * 0.05
         if hi - lo > max_swing:
             center = (o + c) / 2
             hi = center + max_swing / 2
@@ -427,14 +542,21 @@ def render_bars_from_script(
             # 重新确保 OHLC 合法
             hi = max(hi, o, c)
             lo = min(lo, o, c)
-        vol = _gen_volume(script, progress, rng, log_ret, base_vol)
+        is_edge = bool(use_seed and (boundary[i] or i == n - 1 or (i + 1 < n and boundary[i + 1])))
+        vol = _gen_volume(
+            script, progress, rng, log_ret, base_vol,
+            log_sigma=seed_profile.vol_log_sigma if use_seed else 0.0,
+            edge_factor=seed_profile.vol_edge_factor if use_seed else 1.0,
+            is_edge=is_edge,
+        )
 
+        dp = decimals if use_seed else 2
         bars.append({
             "time": _format_time(times[i], timeframe),
-            "open": round(o, 2),
-            "high": round(hi, 2),
-            "low": round(lo, 2),
-            "close": round(c, 2),
+            "open": round(o, dp),
+            "high": round(hi, dp),
+            "low": round(lo, dp),
+            "close": round(c, dp),
             "volume": vol,
         })
         prev_close = c
@@ -465,7 +587,12 @@ async def generate_synthetic_series(
     ref_price: float | None,
     seed: int | None = None,
 ) -> SyntheticSeries:
-    """生成完整合成 K 线序列"""
+    """生成完整合成 K 线序列。
+
+    接入了历史数据（provider/CSV，见 synthetic_seed）时先随机抽取
+    该品种一段真实历史作种子（微观结构校准：波动率聚集/跳空/量能
+    分布）；未接入或失败静默回退纯合成路径，主链路不受影响。
+    """
     tf = (timeframe or "1d").strip().lower()
     if tf not in BARS_PER_DAY:
         raise ValueError("不支持的 K 线周期")
@@ -474,19 +601,40 @@ async def generate_synthetic_series(
     bars_per_day = BARS_PER_DAY[tf]
     num_bars = min(MAX_BARS, days * bars_per_day)
 
-    rprice = resolve_ref_price(symbol, ref_price)
-    amp = DEFAULT_AMPLITUDE.get(tf, 0.015)
+    # 随机历史种子：取段随机性与渲染共用同一 rng（seed 给定则整链可复现）
+    profile: HistorySeedProfile | None = None
+    if symbol:
+        seed_rng = random.Random(seed) if seed is not None else random.Random()
+        seg: list[dict[str, Any]] | None = None
+        try:
+            seg = await resolve_seed_segment(symbol, tf, num_bars, seed_rng)
+        except Exception as exc:  # 种子失败绝不阻断生成
+            logger.warning("历史种子获取异常，回退纯合成: %s", exc)
+        if seg:
+            profile = build_seed_profile(seg, tf, symbol=symbol)
+        if profile is not None:
+            logger.info(
+                "合成历史种子就绪: %s %s %s~%s %d根",
+                symbol, tf, profile.start, profile.end, len(profile.bars),
+            )
+
+    # 基准价/振幅：有种子时用种子末收与真实振幅中位（贴合该品种
+    # 该时期的真实量级），无种子保持前端参考价/默认表
+    rprice = profile.ref_price if profile else resolve_ref_price(symbol, ref_price)
+    amp = profile.amplitude if profile else DEFAULT_AMPLITUDE.get(tf, 0.015)
 
     script = await generate_market_script(
         session, user_id, model_row_id,
         symbol=symbol, symbol_name=symbol_name, timeframe=tf,
         num_bars=num_bars, ref_price=rprice, amplitude=amp,
+        seed_profile=profile,
     )
     bars = render_bars_from_script(
         script, symbol=symbol, timeframe=tf, num_bars=num_bars,
         ref_price=rprice, amplitude=amp, seed=seed,
+        seed_profile=profile,
     )
-    meta = {
+    meta: dict[str, Any] = {
         "num_bars": len(bars),
         "num_days": days,
         "ref_price": rprice,
@@ -494,6 +642,19 @@ async def generate_synthetic_series(
         "symbol": symbol,
         "timeframe": tf,
     }
+    if profile is not None:
+        meta["history_seed"] = {
+            "used": True,
+            "symbol": profile.symbol,
+            "start": profile.start,
+            "end": profile.end,
+            "bars": len(profile.bars),
+            "bar_sigma": round(profile.bar_sigma, 6),
+            "gap_rate": round(profile.gap_rate, 3),
+            "vol_median": profile.vol_median,
+        }
+    else:
+        meta["history_seed"] = {"used": False}
     return SyntheticSeries(bars=bars, script=script, meta=meta)
 
 

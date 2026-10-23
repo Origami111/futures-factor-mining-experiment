@@ -505,6 +505,9 @@ export function SyntheticReplay({
         <div className="text-[var(--text-muted)]">
           AI 合成 K 线 · {generated.script.regime} · {generated.meta.num_bars} 根 ·{" "}
           {generated.meta.ref_price.toFixed(0)} 起
+          {generated.meta.history_seed?.used
+            ? ` · 真实种子 ${generated.meta.history_seed.start?.slice(0, 10)}~${generated.meta.history_seed.end?.slice(0, 10)} ${generated.meta.history_seed.bars}根`
+            : ""}
           {aiCalls > 0 && ` · AI ${aiCalls} 次`}
         </div>
         <div className="text-[var(--text-muted)]">
